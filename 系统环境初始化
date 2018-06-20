@@ -1,0 +1,219 @@
+#生成ssh-key，不设密码 
+[root@node1 ~]# ssh-keygen -t rsa -b 4096 -C "seanzhau@gmail.com"
+Generating public/private rsa key pair.
+Enter file in which to save the key (/root/.ssh/id_rsa): 
+...
+[root@node1 ~]# ls -lh .ssh/
+total 12K
+-rw-------. 1 root root 3.2K Nov  9 10:17 id_rsa
+-rw-r--r--. 1 root root  744 Nov  9 10:17 id_rsa.pub
+-rw-r--r--. 1 root root  516 Nov  9 10:20 known_hosts
+#配置hosts
+[root@node1 ~]# vim /etc/hosts
+127.0.0.1   localhost localhost.localdomain localhost4 localhost4.localdomain4
+::1         localhost localhost.localdomain localhost6 localhost6.localdomain6
+192.168.100.101 node1
+192.168.100.102 node2
+192.168.100.103 node3
+192.168.100.104 node4
+192.168.100.105 node5
+#提交到所有服务器 
+[root@node1 ~]# ssh-copy-id -i ~/.ssh/id_rsa.pub node1
+[root@node1 ~]# ssh-copy-id -i ~/.ssh/id_rsa.pub node2
+[root@node1 ~]# ssh-copy-id -i ~/.ssh/id_rsa.pub node3
+[root@node1 ~]# ssh-copy-id -i ~/.ssh/id_rsa.pub node4
+[root@node1 ~]# ssh-copy-id -i ~/.ssh/id_rsa.pub node5
+#验证
+[root@node1 ~]# ssh node1
+...
+[root@node1 ~]# ssh 192.168.100.101
+...
+
+
+#########################################
+#配置 yum 源到 aliyun mirror
+[root@node1 ~]# rm - rf /etc/yum.repos.d/\*.conf  #去掉\
+[root@node1 ~]# curl -o /etc/yum.repos.d/CentOS-Base.repo http://mirrors.aliyun.com/repo/Centos-7.repo
+[root@node1 ~]# curl -o /etc/yum.repos.d/epel.repo http://mirrors.aliyun.com/repo/epel-7.repo
+[root@node1 ~]# yum makecache
+#安装ansible
+[root@node1 ~]# yum install ansible pyOpenSSL python2-pip -y
+[root@node1 ~]# pip install -U pip ansible ipaddress
+##############################################
+#简单配置ansible
+[root@node1 ~]# vim /etc/ansible/hosts
+[hostnames]
+192.168.100.101 hostname=node1
+192.168.100.102 hostname=node2
+192.168.100.103 hostname=node3
+192.168.100.104 hostname=node4
+192.168.100.105 hostname=node5
+#批量修改主机名与hosts保持一致，安装过程中会遇到找不到主机名的报错。
+[root@node1 ~]# vim hostnames.yml
+---
+- hosts: hostnames
+  remote_user: root
+  tasks:
+     - name: change name
+       raw: "echo {{hostname|quote}} > /etc/hostname"
+     - name:
+       shell: hostnamectl set-hostname {{hostname|quote}}
+[root@node1 ~]# ansible-playbook hostnames.yml
+#分发配置 yum 源
+[root@node1 ~]# ansible node2:node3:node4:node5 -m shell -a 'rm - rf /etc/yum.repos.d/\*.conf'  #去掉\
+[root@node1 ~]# ansible all -m copy -a 'src=/etc/yum.repos.d/ dest=/etc/'
+[root@node1 ~]# ansible all -m copy -a 'src=/etc/hosts dest=/etc/hosts'
+#查看操作系统版本
+[root@node1 ~]# ansible all -m shell -a 'cat /etc/redhat-release'
+192.168.100.101 | SUCCESS | rc=0 >>
+CentOS Linux release 7.4.1708 (Core)
+...
+#安装基本软件环境
+[root@node1 ~]# ansible all -m shell -a 'yum -y install vim telnet bind-utils htop git bash-completion net-tools iptables iptables-services NetworkManager'
+#关闭firewall，启用iptables和NetworkManager
+[root@node1 ~]# ansible all -m shell -a 'systemctl disable firewalld && systemctl stop firewalld'
+[root@node1 ~]# ansible all -m shell -a 'systemctl enable iptables && systemctl start iptables'
+[root@node1 ~]# ansible all -m shell -a 'systemctl enable NetworkManager && systemctl start NetworkManager'
+#关闭selinux（可不关）
+[root@node1 ~]# ansible all -m shell -a 'sed -i "/^SELINUX=/c\SELINUX=disabled" /etc/sysconfig/selinux'
+#配置iptables
+[root@node1 ~]# ansible all -m shell -a 'iptables -A INPUT -s 192.168.100.0/24 -p udp -m state --state NEW -m udp -j ACCEPT'
+[root@node1 ~]# ansible all -m shell -a 'iptables -A INPUT -s 192.168.100.0/24 -p tcp -m state --state NEW -m tcp -j ACCEPT'
+[root@node1 ~]# ansible all -m shell -a 'iptables-save > /etc/sysconfig/iptables'
+[root@node1 ~]# ansible all -m shell -a 'sed -i "/icmp-host-prohibited/d" /etc/sysconfig/iptables'
+#安装dnsmasq，如果直接配置了公网域名解析请忽略。（建议单独使用一台低配置服务器部署，不在openshift-ansible安装范围内）
+[root@node1 ~]# yum install dnsmasq -y
+[root@node1 ~]# vim /etc/dnsmasq.d/node-dnsmasq.conf
+server=/in-addr.arpa/127.0.0.1
+server=/cluster.local/127.0.0.1
+address=/.ipaas.seanzhau.com/192.168.100.101
+address=/www.ipaas.seanzhau.com/192.168.100.101
+[root@node1 ~]# vim /etc/dnsmasq.d/origin-dns.conf
+no-resolv
+domain-needed
+no-negcache
+max-cache-ttl=1
+enable-dbus
+dns-forward-max=5000
+cache-size=5000
+bind-dynamic
+except-interface=lo
+# End of config
+[root@node1 ~]# vim /etc/dnsmasq.d/origin-upstream-dns.conf
+server=223.5.5.5
+server=223.6.6.6
+#配置dnsmasq服务
+[root@node1 ~]# systemctl disable dnsmasq && systemctl start dnsmasq
+#修改网卡DNS配置
+[root@node1 ~]# ansible all -m shell -a 'sed -i "/DNS1/c\DNS1=192.168.100.101" /etc/sysconfig/network-scripts/ifcfg-eth0'
+#重启系统
+[root@node1 ~]# ansible node2:node3:node4:node5 -m shell -a 'reboot'
+[root@node1 ~]# reboot
+#验证配置
+[root@node1 ~]# ansible all -m shell -a 'hostname'
+192.168.100.103 | SUCCESS | rc=0 >>
+node3
+...
+[root@node1 ~]# ansible all -m shell -a 'dig www.ipaas.seanzhau.com'
+192.168.100.102 | SUCCESS | rc=0 >>
+; <<>> DiG 9.9.4-RedHat-9.9.4-51.el7_4.2 <<>> www.ipaas.seanzhau.com
+;; global options: +cmd
+;; Got answer:
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 61931
+;; flags: qr aa rd ra ad; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 0
+;; QUESTION SECTION:
+;www.ipaas.seanzhau.com.        IN  A
+;; ANSWER SECTION:
+www.ipaas.seanzhau.com. 0   IN  A   192.168.100.101
+;; Query time: 0 msec
+;; SERVER: 192.168.100.101#53(192.168.100.101)
+;; WHEN: Mon Apr 16 14:35:58 CST 2018
+;; MSG SIZE  rcvd: 55
+...
+[root@node1 ~]# ansible all -m shell -a 'systemctl status firewalld iptables NetworkManager | grep Active -B3'
+192.168.100.101 | SUCCESS | rc=0 >>
+● firewalld.service - firewalld - dynamic firewall daemon
+   Loaded: loaded (/usr/lib/systemd/system/firewalld.service; disabled; vendor preset: enabled)
+   Active: inactive (dead)
+--
+● iptables.service - IPv4 firewall with iptables
+   Loaded: loaded (/usr/lib/systemd/system/iptables.service; enabled; vendor preset: disabled)
+   Active: active (exited) since Sun 2018-04-15 18:26:48 CST; 17h ago
+--
+● NetworkManager.service - Network Manager
+   Loaded: loaded (/usr/lib/systemd/system/NetworkManager.service; enabled; vendor preset: enabled)
+   Active: active (running) since Sun 2018-04-15 18:26:47 CST; 17h ago
+...
+#安装docker环境 
+[root@node1 ~]# ansible all -m shell -a 'yum install docker -y'
+[root@node1 ~]# ansible all -m shell -a 'systemctl start docker && systemctl enable docker'
+#验证安装
+[root@node1 ~]# ansible all -m shell -a 'docker version'
+192.168.100.101 | SUCCESS | rc=0 >>
+Client:
+ Version:   18.03.0-ce
+ API version:   1.37
+ Go version:    go1.9.2
+ Git commit:    0520e24
+ Built: Wed Mar 21 23:05:52 2018
+ OS/Arch:   linux/amd64
+ Experimental:  false
+ Orchestrator:  swarm
+Server:
+ Engine:
+  Version:  18.03.0-ce
+  API version:  1.37 (minimum version 1.12)
+  Go version:   go1.9.4
+  Git commit:   0520e24
+  Built:    Wed Mar 21 23:14:54 2018
+  OS/Arch:  linux/amd64
+  Experimental: true
+...
+#我使用的docker版本比较高，安装方式是https://github.com/gjmzj/kubeasz中的playbook，安装包需要根据他的文档提前下载。
+[root@node1 kubeasz]# cd kubeasz
+[root@node1 kubeasz]# vim docker_install.yml
+- hosts:
+  - hostnames
+  roles:
+  - docker
+[root@node1 kubeasz]# ansible-playbook docker_install.yml
+[root@node1 kubeasz]# cd
+#配置docker
+[root@node1 ~]# vim /etc/docker/daemon.json
+{
+    "registry-mirrors": [
+        "https://registry.docker-cn.com",
+        "https://kuamavit.mirror.aliyuncs.com",
+        "https://docker.mirrors.ustc.edu.cn"
+    ],
+    "exec-opts": ["native.cgroupdriver=systemd"],
+    "debug": true,
+    "experimental": true,
+    "max-concurrent-downloads": 10,
+    "log-driver": "json-file",
+    "log-level": "warn",
+    "log-opts": {
+        "max-size": "10m",
+        "max-file": "3"
+    }
+}
+#分发配置
+[root@node1 ~]# ansible all -m copy -a 'src=/etc/docker/daemon.json dest=/etc/docker/daemon.json'
+#重启服务
+[root@node1 ~]# ansible all -m shell -a 'systemctl restart docker'
+#验证配置
+[root@node1 ~]# ansible all -m shell -a 'docker info'
+192.168.100.101 | SUCCESS | rc=0 >>
+Containers: 0
+ Running: 0
+ Paused: 0
+ Stopped: 0
+Images: 0
+Server Version: 18.03.0-ce
+Storage Driver: overlay2
+ Backing Filesystem: xfs
+ Supports d_type: true
+ Native Overlay Diff: true
+Logging Driver: json-file
+Cgroup Driver: systemd
+...
